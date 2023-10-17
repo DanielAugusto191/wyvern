@@ -151,11 +151,8 @@ get_data_dependences_for(
   return std::make_tuple(BBs, deps);
 }
 
-ProgramSlice::ProgramSlice(Instruction &Initial, Function &F,
-                           CallInst &CallSite, AAResults *AA,
-                           TargetLibraryInfo &TLI, bool thunkDebugging)
-    : _AA(AA), _TLI(TLI), _initial(&Initial), _parentFunction(&F),
-      _thunkDebugging(thunkDebugging) {
+ProgramSlice::ProgramSlice(Instruction &Initial, Function &F, int i)
+    : _initial(&Initial), _parentFunction(&F), _a(i){
   assert(Initial.getParent()->getParent() == &F &&
          "Slicing instruction from different function!");
 
@@ -176,7 +173,6 @@ ProgramSlice::ProgramSlice(Instruction &Initial, Function &F,
   _instsInSlice = instsInSlice;
   _depArgs = depArgs;
   _BBsInSlice = BBsInSlice;
-  _CallSite = &CallSite;
 
   // We need to pre-compute struct types, because if we build it everytime
   // it's needed, LLVM creates multiple types with the same structure but
@@ -239,7 +235,6 @@ void ProgramSlice::printSlice() {
                     << _parentFunction->getName() << " with size "
                     << _parentFunction->size() << " in instruction" << *_initial
                     << " ====\n");
-  LLVM_DEBUG(dbgs() << "==== Call site: " << *_CallSite << " ====\n");
   LLVM_DEBUG(dbgs() << "BBs in slice:\n");
   for (const BasicBlock *BB : _BBsInSlice) {
     LLVM_DEBUG(dbgs() << "\t" << BB->getName() << "\n");
@@ -487,27 +482,6 @@ void ProgramSlice::rerouteBranches(Function *F) {
 bool ProgramSlice::canOutline() {
   DominatorTree DT(*_parentFunction);
   LoopInfo LI = LoopInfo(DT);
-  AliasSetTracker AST(*_AA);
-
-  // Build alias sets for memory instructions in the function.
-  for (BasicBlock &BB : *_parentFunction) {
-    for (Instruction &I : BB) {
-      if (StoreInst *SI = dyn_cast<StoreInst>(&I)) {
-        AST.add(SI);
-      } else if (CallBase *CB = dyn_cast<CallBase>(&I)) {
-        if (CB == _CallSite) {
-          continue;
-        }
-        AST.add(CB);
-      } else if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
-        AST.add(LI);
-      } else if (AnyMemSetInst *MSI = dyn_cast<AnyMemSetInst>(&I)) {
-        AST.add(MSI);
-      } else if (AnyMemTransferInst *MTI = dyn_cast<AnyMemTransferInst>(&I)) {
-        AST.add(MTI);
-      }
-    }
-  }
 
   // LLVM does not provide alias/memory dependence information for allocas.
   // Thus, we track allocas that belong in the slice explicitly, so we can then
@@ -529,15 +503,6 @@ bool ProgramSlice::canOutline() {
                  << *underlying << "\n";
           return false;
         }
-      } else if (LoadInst *LI = dyn_cast<LoadInst>(&I)) {
-        if (AST.getAliasSetFor(MemoryLocation::get(LI)).isMod()) {
-          Value *underlying = getUnderlyingObject(LI->getPointerOperand());
-          if (allocasInSlice.contains(underlying)) {
-            errs() << "Cannot outline slice because alloca is clobbered: "
-                   << *underlying << "\n";
-            return false;
-          }
-        }
       }
     }
   }
@@ -557,73 +522,16 @@ bool ProgramSlice::canOutline() {
       }
 
       LibFunc builtin;
-      if (CB->getCalledFunction()->isDeclaration() &&
-          !_TLI.getLibFunc(*CB, builtin)) {
+      if (CB->getCalledFunction()->isDeclaration()) {
         errs() << "Cannot outline slice because instruction calls non-builtin "
                   "function with no body: "
                << *CB << "\n";
         return false;
       }
     }
-
-    // For instructions that may read or write to memory, we need some special
-    // care to avoid load/store reordering and/or side effects.
-    if (I->mayReadOrWriteMemory()) {
-      if (const LoadInst *LI = dyn_cast<LoadInst>(I)) {
-        // For loads, we invalidate outlining if its address can be modified.
-        // This is possible if the memory location pointed to by the load is
-        // written/modified by any possibly aliasing pointer or clobbering
-        // function call.
-        if (AST.getAliasSetFor(MemoryLocation::get(LI)).isMod()) {
-          errs()
-              << "Cannot outline slice because load address can be modified: "
-              << *LI << "\n";
-          return false;
-        }
-
-      } else if (const CallBase *CB = dyn_cast<CallBase>(I)) {
-        // For function calls, if the call has any side effects (as in, is not
-        // read-only), we can't outline the slice.
-        if (!_AA->onlyReadsMemory(CB->getCalledFunction())) {
-          errs() << "Cannot outline because call may write to memory: " << *CB
-                 << "\n";
-          return false;
-        }
-      } else {
-        errs() << "Cannot outline because inst may read or write to memory: "
-               << *I << "\n";
-        return false;
-      }
-    }
-
     else if (!I->willReturn()) {
       errs() << "Cannot outline because inst may not return: " << *I << "\n";
       return false;
-    }
-
-    for (const Value *arg : _CallSite->args()) {
-      if (arg == _initial) {
-        continue;
-      }
-      if (arg->getType()->isPointerTy() && I->getType()->isPointerTy()) {
-        if (_AA->alias(arg, I) != AliasResult::NoAlias) {
-          errs() << "Cannot outline slice because pointer used in slice is "
-                    "passed as argument to callee.\nPointer: "
-                 << *I << "\nArgument: " << *arg << "\n";
-          return false;
-        }
-      }
-    }
-  }
-
-  if (LI.getLoopDepth(_CallSite->getParent()) > 0) {
-    for (const BasicBlock *BB : _BBsInSlice) {
-      if (LI.getLoopDepth(BB) <= LI.getLoopDepth(_CallSite->getParent())) {
-        errs() << "BB " << BB->getName()
-               << " is in same or lower loop depth as CallSite BB "
-               << _CallSite->getParent()->getName() << "\n";
-        return false;
-      }
     }
   }
 
@@ -662,7 +570,13 @@ SmallVector<Value *> ProgramSlice::getOrigFunctionArgs() {
 /// to the @param originalBB from the original function being
 /// sliced.
 void ProgramSlice::insertNewBB(const BasicBlock *originalBB, Function *F) {
-  auto originalName = originalBB->getName();
+//  std::random_device rd;
+//  std::mt19937 mt(rd());
+//  std::uniform_int_distribution<int64_t> dist(1, 1000000000);
+//  uint64_t random_num = dist(mt);
+  std::string as = "ok";
+	// TODO: The problem here is to get something at originalBB, using this temporary name seems to work but it probaly will make hard to identify which function the slice is
+	auto originalName = originalBB->getName();
   std::string newBBName = "sliceclone_" + originalName.str();
   BasicBlock *newBB =
       BasicBlock::Create(F->getParent()->getContext(), newBBName, F);
@@ -877,18 +791,6 @@ void ProgramSlice::addMemoizationCode(Function *F, ReturnInst *new_ret) {
   LoadInst *memoFlagLoad =
       builder.CreateLoad(thunkStructType->getStructElementType(2), memoFlagGEP,
                          "_wyvern_memo_flag");
-
-  if (_thunkDebugging) {
-    std::string dbg_fmt;
-    std::vector<Value *> debug_args;
-    raw_string_ostream rso(dbg_fmt);
-
-    rso << "== Wyvern Debugging ==\nEvaluating thunk!\n";
-    rso << "\ti1 memo_flag = %d\n";
-    debug_args.push_back(memoFlagLoad);
-    rso << "======================\n";
-    generatePrintf(dbg_fmt, debug_args, builder);
-  }
 
   // add if (memoFlag == true) { return memo_val; }
   Value *toBool = builder.CreateTruncOrBitCast(

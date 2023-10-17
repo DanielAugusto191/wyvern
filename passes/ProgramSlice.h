@@ -14,8 +14,7 @@ public:
   /// Creates a backward slice of function F in terms of slice criterion I,
   /// which is passed as a parameter in call CallSite. Optionally, receives the
   /// result of an Alias Analysis in AA to perform memory safety analysis.
-  ProgramSlice(Instruction &I, Function &F, CallInst &CallSite, AAResults *AA,
-               TargetLibraryInfo &TLI, bool thunkDebugging);
+  ProgramSlice(Instruction &I, Function &F, int i);
 
   /// Returns whether the slice can be safely outlined into a delegate function.
   bool canOutline();
@@ -35,6 +34,7 @@ public:
   /// Returns the delegate function resulted from outlining the slice, using
   /// memoization.
   Function *memoizedOutline();
+  int _a;
 
 private:
   void insertLoadForThunkParams(Function *F, bool memo);
@@ -72,7 +72,6 @@ private:
   std::set<const BasicBlock *> _BBsInSlice;
 
   /// function call being lazified
-  CallInst *_CallSite;
 
   // @_Imap ->
   /// maps each BasicBlock to its attractor (its first  dominator), used for
@@ -98,13 +97,5 @@ private:
   StructType *_thunkStructType;
   StructType *_memoizedThunkStructType;
 
-  /// Alias analysis used to evaluate slice safety
-  AAResults *_AA;
-
-  /// TargetLibraryInfo for the function, used to detect standard library
-  /// functions
-  TargetLibraryInfo &_TLI;
-
-  bool _thunkDebugging;
 };
 } // namespace llvm
